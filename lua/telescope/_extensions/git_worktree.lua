@@ -12,14 +12,14 @@ local action_state = require("telescope.actions.state")
 local Job = require("plenary.job")
 local Path = require("plenary.path")
 
--- ─────────────────────────────────────────────────────────────────────────────
--- Config (can be overridden via telescope.setup{ extensions.git_worktree = { ... }})
--- ─────────────────────────────────────────────────────────────────────────────
+-- ╭──────────────────────────────────────────────────────────────────────────╮
+-- │ Config (override via telescope.setup{ extensions.git_worktree = { ... }})│
+-- ╰──────────────────────────────────────────────────────────────────────────╯
 local M = {}
 local cfg = {
 	chdir_mode = "tcd", -- "cd" | "lcd" | "tcd"
-	open_after = "mini-files", -- "mini-files" | "telescope" | "oil" | "nvim-tree" | "none"
-	close_other_explorers = true, -- close Oil/Neo-tree/NvimTree windows before opening the post-switch UI
+	open_after = "oil", -- "oil" | "mini-files" | "telescope" | "nvim-tree" | "none"
+	close_other_explorers = true, -- close Oil/Neo-tree/NvimTree windows before opening post-switch UI
 	copy_files = { ".env", ".env.local" },
 	on_switch = nil, -- function(path, branch) end
 }
@@ -28,9 +28,9 @@ function M.setup(user_cfg)
 	cfg = vim.tbl_deep_extend("force", cfg, user_cfg or {})
 end
 
--- ─────────────────────────────────────────────────────────────────────────────
--- Helpers
--- ─────────────────────────────────────────────────────────────────────────────
+-- ╭──────────────────────────────────────────────────────────────────────────╮
+-- │ Helpers                                                                  │
+-- ╰──────────────────────────────────────────────────────────────────────────╯
 local function sh(args, cwd)
 	local job = Job:new({ command = args[1], args = { unpack(args, 2) }, cwd = cwd })
 	local ok, err = pcall(function()
@@ -95,7 +95,6 @@ local function close_explorer_windows_in_tab()
 end
 
 local function refresh_explorers(_)
-	-- only reload if running; never open/steal focus
 	if package.loaded["nvim-tree.api"] then
 		pcall(function()
 			require("nvim-tree.api").tree.reload()
@@ -106,7 +105,7 @@ local function refresh_explorers(_)
 			require("neo-tree.command").execute({ action = "refresh", source = "filesystem" })
 		end)
 	end
-	-- intentionally no Oil call here
+	-- intentionally no Oil refresh/open here (we open it explicitly below)
 end
 
 local function ensure_branch_checked_out(path, branch)
@@ -121,12 +120,16 @@ end
 
 local function open_after_switch(path)
 	local mode = cfg.open_after
-	if mode == "mini-files" then
+	if mode == "oil" and package.loaded["oil"] then
+		vim.schedule(function()
+			require("oil").open(path)
+		end)
+	elseif mode == "mini-files" then
 		vim.schedule(function()
 			local ok, mf = pcall(require, "mini.files")
 			if ok then
 				mf.open(path)
-			end -- use mf.open(path, true) to replace current window
+			end
 		end)
 	elseif mode == "telescope" then
 		vim.schedule(function()
@@ -134,10 +137,6 @@ local function open_after_switch(path)
 			if ok then
 				builtin.find_files({ cwd = path, hidden = true, no_ignore = false })
 			end
-		end)
-	elseif mode == "oil" and package.loaded["oil"] then
-		vim.schedule(function()
-			require("oil").open(path)
 		end)
 	elseif mode == "nvim-tree" and package.loaded["nvim-tree.api"] then
 		vim.schedule(function()
@@ -176,7 +175,6 @@ local function delete_worktree(path, force, branch)
 		table.insert(args, "--force")
 	end
 	table.insert(args, path)
-
 	local code, _, err = sh(args)
 	if code ~= 0 then
 		vim.notify("Failed to delete worktree:\n" .. table.concat(err, "\n"), vim.log.levels.ERROR)
@@ -198,17 +196,7 @@ local function delete_worktree(path, force, branch)
 	end
 end
 
-local function make_entries_with_current_mark()
-	local cwd = Path:new(vim.fn.getcwd()):absolute()
-	local entries = {}
-	for _, wt in ipairs(get_worktrees()) do
-		local path, branch = parse_worktree(wt)
-		local star = (path == cwd) and "* " or ""
-		table.insert(entries, { path = path, branch = branch, display = ("%s%s (%s)"):format(star, branch, path) })
-	end
-	return entries
-end
-
+-- Copy configured files into new worktree
 local function copy_env_files(to_path)
 	local from = Path:new(vim.fn.getcwd())
 	for _, name in ipairs(cfg.copy_files or {}) do
@@ -223,32 +211,133 @@ local function copy_env_files(to_path)
 	end
 end
 
-local function get_available_branches()
-	local code, all = sh({ "git", "branch", "--format=%(refname:short)" })
-	if code ~= 0 then
-		return {}
-	end
-	local existing = {}
-	for _, wt in ipairs(get_worktrees()) do
-		if wt.branch then
-			existing[wt.branch:gsub("^refs/heads/", "")] = true
-		end
-	end
-	local avail = {}
-	for _, b in ipairs(all) do
-		if b ~= "" and not existing[b] then
-			table.insert(avail, b)
-		end
-	end
-	return avail
+-- ── branch utilities ─────────────────────────────────────────────────────────
+local function branch_exists_local(branch)
+	local code = sh({ "git", "show-ref", "--verify", "--quiet", "refs/heads/" .. branch })
+	return code == 0
 end
 
--- ─────────────────────────────────────────────────────────────────────────────
--- Pickers
--- ─────────────────────────────────────────────────────────────────────────────
+local function branch_exists_remote(branch)
+	-- fast path (common remote 'origin')
+	if sh({ "git", "show-ref", "--verify", "--quiet", "refs/remotes/origin/" .. branch }) == 0 then
+		return true
+	end
+	local code, out = sh({ "git", "for-each-ref", "--format=%(refname:short)", "refs/remotes" })
+	if code ~= 0 then
+		return false
+	end
+	for _, line in ipairs(out or {}) do
+		if not line:find(" HEAD -> ") and line:match(".+/" .. vim.pesc(branch) .. "$") then
+			return true
+		end
+	end
+	return false
+end
+
+local function branch_in_any_worktree(branch)
+	for _, wt in ipairs(get_worktrees()) do
+		if wt.branch and wt.branch:gsub("^refs/heads/", "") == branch then
+			return true, wt.worktree
+		end
+	end
+	return false, nil
+end
+
+-- create worktree with smart logic based on branch presence/attachment
+local function add_worktree_smart(path, branch, opts)
+	opts = opts or {}
+	local attached, where = branch_in_any_worktree(branch)
+
+	if attached and not opts.allow_detach then
+		local choice = vim.fn.confirm(
+			("Branch '%s' is already checked out at:\n%s\n\nCreate detached worktree at HEAD instead?"):format(
+				branch,
+				where
+			),
+			"&Detached\n&Cancel\n&Rename",
+			1
+		)
+		if choice == 2 then
+			return false, "cancelled"
+		end
+		if choice == 3 then
+			local newb = vim.fn.input("New branch name: ", branch .. "-2")
+			if newb == "" then
+				return false, "cancelled"
+			end
+			branch = newb
+			attached = false
+		else
+			local code, _, err = sh({ "git", "worktree", "add", path })
+			return code == 0, code == 0 and nil or table.concat(err, "\n"), branch
+		end
+	end
+
+	if branch_exists_local(branch) then
+		local code, _, err = sh({ "git", "worktree", "add", path, branch })
+		return code == 0, code == 0 and nil or table.concat(err, "\n"), branch
+	elseif branch_exists_remote(branch) then
+		local code, _, err = sh({ "git", "worktree", "add", path, "-b", branch, "origin/" .. branch })
+		return code == 0, code == 0 and nil or table.concat(err, "\n"), branch
+	else
+		local code, _, err = sh({ "git", "worktree", "add", path, "-b", branch })
+		return code == 0, code == 0 and nil or table.concat(err, "\n"), branch
+	end
+end
+
+-- collect ALL local + remote branch names (dedup, strip remote prefix)
+local function list_all_branches()
+	local names = {}
+
+	-- locals
+	do
+		local code, out = sh({ "git", "for-each-ref", "--format=%(refname:short)", "refs/heads" })
+		if code == 0 then
+			for _, b in ipairs(out or {}) do
+				if b ~= "" then
+					names[b] = true
+				end
+			end
+		end
+	end
+
+	-- remotes
+	do
+		local code, out = sh({ "git", "for-each-ref", "--format=%(refname:short)", "refs/remotes" })
+		if code == 0 then
+			for _, b in ipairs(out or {}) do
+				if b ~= "" and not b:find(" HEAD -> ") then
+					-- strip "<remote>/" prefix (origin/feat -> feat)
+					local stripped = b:gsub("^[^/]+/", "")
+					names[stripped] = true
+				end
+			end
+		end
+	end
+
+	-- to sorted list
+	local list = {}
+	for name in pairs(names) do
+		table.insert(list, name)
+	end
+	table.sort(list)
+	return list
+end
+
+-- ╭──────────────────────────────────────────────────────────────────────────╮
+-- │ Pickers                                                                  │
+-- ╰──────────────────────────────────────────────────────────────────────────╯
+-- List/switch/delete worktrees. Display ONLY branch name.
 local function git_worktrees(opts)
 	opts = opts or {}
-	local entries = make_entries_with_current_mark()
+	local cwd = Path:new(vim.fn.getcwd()):absolute()
+
+	local entries = {}
+	for _, wt in ipairs(get_worktrees()) do
+		local path, branch = parse_worktree(wt)
+		local star = (path == cwd) and "* " or ""
+		table.insert(entries, { path = path, branch = branch, display = star .. branch })
+	end
 
 	pickers
 		.new(opts, {
@@ -256,7 +345,7 @@ local function git_worktrees(opts)
 			finder = finders.new_table({
 				results = entries,
 				entry_maker = function(e)
-					return { value = e, display = e.display, ordinal = e.branch .. " " .. e.path }
+					return { value = e, display = e.display, ordinal = e.branch }
 				end,
 			}),
 			sorter = sorters.get_generic_fuzzy_sorter(),
@@ -298,11 +387,12 @@ local function git_worktrees(opts)
 		:find()
 end
 
+-- Create from branch picker (ALL local+remote branches; displays ONLY name)
 local function create_from_branch_git_worktree(opts)
 	opts = opts or {}
-	local branches = get_available_branches()
+	local branches = list_all_branches()
 	if #branches == 0 then
-		vim.notify("No available branches.", vim.log.levels.INFO)
+		vim.notify("No branches found (local or remote).", vim.log.levels.INFO)
 		return
 	end
 	local entries = vim.tbl_map(function(b)
@@ -311,7 +401,7 @@ local function create_from_branch_git_worktree(opts)
 
 	pickers
 		.new(opts, {
-			prompt_title = "Select branch for worktree",
+			prompt_title = "Select branch for worktree (local + remote)",
 			finder = finders.new_table({
 				results = entries,
 				entry_maker = function(e)
@@ -330,12 +420,11 @@ local function create_from_branch_git_worktree(opts)
 							new_path = branch
 						end
 						vim.ui.input({ prompt = "Upstream (optional): " }, function(upstream)
-							local code, _, err = sh({ "git", "worktree", "add", new_path, branch })
-							if code ~= 0 then
-								vim.notify(
-									"Failed to create worktree:\n" .. table.concat(err, "\n"),
-									vim.log.levels.ERROR
-								)
+							local ok, err = add_worktree_smart(new_path, branch)
+							if not ok then
+								if err ~= "cancelled" then
+									vim.notify("Failed to create worktree:\n" .. (err or ""), vim.log.levels.ERROR)
+								end
 								return
 							end
 							copy_env_files(new_path)
@@ -355,6 +444,7 @@ local function create_from_branch_git_worktree(opts)
 		:find()
 end
 
+-- Create NEW branch worktree (smart handling if name exists / remote-only)
 local function create_new_git_worktree(opts)
 	opts = opts or {}
 	vim.ui.input({ prompt = "New branch name: " }, function(branch)
@@ -366,27 +456,37 @@ local function create_new_git_worktree(opts)
 				new_path = branch
 			end
 			vim.ui.input({ prompt = "Upstream (optional): " }, function(upstream)
-				local code, _, err = sh({ "git", "worktree", "add", new_path, "-b", branch })
-				if code ~= 0 then
-					vim.notify("Failed to create worktree:\n" .. table.concat(err, "\n"), vim.log.levels.ERROR)
+				local ok, err, final_branch = add_worktree_smart(new_path, branch)
+				if not ok then
+					if err ~= "cancelled" then
+						vim.notify("Failed to create worktree:\n" .. (err or ""), vim.log.levels.ERROR)
+					end
 					return
 				end
 				copy_env_files(new_path)
 				if upstream and upstream ~= "" then
 					sh({ "git", "-C", new_path, "branch", "--set-upstream-to", upstream })
 				end
-				vim.notify(("Created worktree: %s (new branch %s)"):format(new_path, branch))
+				local bname = final_branch or branch
+				vim.notify(("Created worktree: %s (branch %s)"):format(new_path, bname))
 				if vim.fn.confirm("Switch to the new worktree?", "&Yes\n&No", 2) == 1 then
-					switch_worktree(Path:new(new_path):absolute(), branch)
+					switch_worktree(Path:new(new_path):absolute(), bname)
 				end
 			end)
 		end)
 	end)
 end
 
+-- Dedicated delete picker
 local function delete_git_worktree(opts)
 	opts = opts or {}
-	local entries = make_entries_with_current_mark()
+	local cwd = Path:new(vim.fn.getcwd()):absolute()
+	local entries = {}
+	for _, wt in ipairs(get_worktrees()) do
+		local path, branch = parse_worktree(wt)
+		local star = (path == cwd) and "* " or ""
+		table.insert(entries, { path = path, branch = branch, display = star .. branch })
+	end
 	if #entries == 0 then
 		vim.notify("No worktrees to delete.", vim.log.levels.INFO)
 		return
@@ -398,7 +498,7 @@ local function delete_git_worktree(opts)
 			finder = finders.new_table({
 				results = entries,
 				entry_maker = function(e)
-					return { value = e, display = e.display, ordinal = e.branch .. " " .. e.path }
+					return { value = e, display = e.display, ordinal = e.branch }
 				end,
 			}),
 			sorter = sorters.get_generic_fuzzy_sorter(),
@@ -406,7 +506,11 @@ local function delete_git_worktree(opts)
 				actions.select_default:replace(function()
 					local sel = action_state.get_selected_entry()
 					actions.close(prompt_bufnr)
-					local choice = vim.fn.confirm("Delete worktree '" .. sel.value.path .. "'?", "&Yes\n&No\n&Force", 2)
+					local choice = vim.fn.confirm(
+						"Delete worktree for branch '" .. sel.value.branch .. "'?",
+						"&Yes\n&No\n&Force",
+						2
+					)
 					if choice == 1 then
 						delete_worktree(sel.value.path, false, sel.value.branch)
 					elseif choice == 3 then
