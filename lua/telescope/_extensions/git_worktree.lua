@@ -1,74 +1,134 @@
+-- telescope/_extensions/git_worktree.lua
+local has_telescope, telescope = pcall(require, "telescope")
+if not has_telescope then
+	error("git-worktree telescope extension requires nvim-telescope/telescope.nvim")
+end
+
 local finders = require("telescope.finders")
 local sorters = require("telescope.sorters")
 local pickers = require("telescope.pickers")
 local previewers = require("telescope.previewers")
-local action_state = require("telescope.actions.state")
 local actions = require("telescope.actions")
+local action_state = require("telescope.actions.state")
+
 local Job = require("plenary.job")
 local Path = require("plenary.path")
 
--- helper to run commands
+-- -----------------------------------------------------------------------------
+-- Config
+-- -----------------------------------------------------------------------------
+local M = {}
+local cfg = {
+	-- Use :cd (global) or :lcd (window-local)
+	chdir_mode = "cd", -- "cd" | "lcd"
+	-- Extra files to auto-copy into new worktrees
+	copy_files = { ".env", ".env.local" },
+	-- Hook called after switching (path, branch)
+	on_switch = nil, -- function(path, branch) end
+}
+
+function M.setup(user_cfg)
+	cfg = vim.tbl_deep_extend("force", cfg, user_cfg or {})
+end
+
+-- -----------------------------------------------------------------------------
+-- Shell helper
+-- -----------------------------------------------------------------------------
 local function sh(args, cwd)
-	local job = Job:new({
-		command = args[1],
-		args = { unpack(args, 2) },
-		cwd = cwd,
-	})
-	job:sync()
+	local job = Job:new({ command = args[1], args = { unpack(args, 2) }, cwd = cwd })
+	local ok, err = pcall(function()
+		job:sync()
+	end)
+	if not ok then
+		return 1, {}, { tostring(err) }
+	end
 	return job.code, job:result(), job:stderr_result()
 end
 
--- parse `git worktree list --porcelain`
+-- -----------------------------------------------------------------------------
+-- Parse `git worktree list --porcelain`
+-- Handles blocks separated by blank line. Keys may repeat.
+-- -----------------------------------------------------------------------------
 local function get_worktrees()
 	local code, out, err = sh({ "git", "worktree", "list", "--porcelain" })
 	if code ~= 0 then
 		vim.notify(table.concat(err, "\n"), vim.log.levels.ERROR)
 		return {}
 	end
-	local worktrees, current = {}, {}
+
+	local worktrees = {}
+	local current = {}
+
+	local function push_current()
+		if next(current) ~= nil then
+			table.insert(worktrees, current)
+			current = {}
+		end
+	end
+
 	for _, line in ipairs(out) do
 		if line == "" then
-			if next(current) ~= nil then
-				table.insert(worktrees, current)
-			end
-			current = {}
+			push_current()
 		else
-			local key, value = line:match("(%S+)%s+(.*)")
-			if key then
-				current[key] = value
+			local k, v = line:match("^(%S+)%s+(.*)$")
+			if k and v then
+				current[k] = v
 			else
+				-- flags like "bare", "locked", etc (rare here, but keep parity)
 				current[line] = true
 			end
 		end
 	end
-	if next(current) ~= nil then
-		table.insert(worktrees, current)
-	end
+	push_current()
 	return worktrees
 end
 
 local function parse_worktree(wt)
+	-- wt.worktree is always present
 	local path = Path:new(wt.worktree):absolute()
+	-- branch is like "refs/heads/feat-x" when present; otherwise detached HEAD lines exist
 	local branch = wt.branch and wt.branch:gsub("^refs/heads/", "")
-		or (wt.HEAD and ("detached at " .. wt.HEAD:sub(1, 7)) or "detached")
+	if not branch then
+		if wt.HEAD then
+			branch = ("detached at %s"):format(wt.HEAD:sub(1, 7))
+		else
+			branch = "detached"
+		end
+	end
 	return path, branch
 end
 
--- refresh explorers
-local function refresh_explorers()
+-- -----------------------------------------------------------------------------
+-- Refresh explorers (add oil + generic fallback)
+-- -----------------------------------------------------------------------------
+local function refresh_explorers(path)
+	-- oil.nvim
+	if package.loaded["oil"] then
+		pcall(function()
+			-- Open the target directory in current window. If already open, it reloads.
+			require("oil").open_float(path) -- nicer; or require("oil").open(path)
+		end)
+	end
+
+	-- nvim-tree
 	if package.loaded["nvim-tree.api"] then
 		pcall(function()
 			require("nvim-tree.api").tree.reload()
 		end)
 	end
-	if package.loaded["neo-tree"] then
+
+	-- neo-tree
+	if package.loaded["neo-tree.command"] then
 		pcall(function()
 			require("neo-tree.command").execute({ action = "refresh", source = "filesystem" })
 		end)
 	end
+
+	-- generic fallback: edit .
+	pcall(vim.cmd, "silent keepalt edit .")
 end
 
--- ensure branch is checked out
+-- Ensure branch is checked out (for newly-added worktrees that might be detached)
 local function ensure_branch_checked_out(path, branch)
 	if not branch or branch:match("^detached") then
 		return
@@ -79,20 +139,33 @@ local function ensure_branch_checked_out(path, branch)
 	end
 end
 
--- switch worktree
+-- -----------------------------------------------------------------------------
+-- Switch worktree (robust chdir + refresh)
+-- -----------------------------------------------------------------------------
 local function switch_worktree(path, branch)
-	vim.cmd("cd " .. vim.fn.fnameescape(path))
+	-- Change directory
+	local cmd = (cfg.chdir_mode == "lcd") and "lcd" or "cd"
+	vim.cmd(cmd .. " " .. vim.fn.fnameescape(path))
+
 	ensure_branch_checked_out(path, branch)
-	refresh_explorers()
-	print(("Switched to worktree: %s (%s)"):format(path, branch or "detached"))
+	refresh_explorers(path)
+
+	if type(cfg.on_switch) == "function" then
+		pcall(cfg.on_switch, path, branch)
+	end
+
+	vim.notify(("Switched to worktree: %s (%s)"):format(path, branch or "detached"))
 end
 
--- delete worktree
+-- -----------------------------------------------------------------------------
+-- Delete worktree (+ optional branch deletion)
+-- -----------------------------------------------------------------------------
 local function delete_worktree(path, force, branch)
 	if Path:new(path):absolute() == Path:new(vim.fn.getcwd()):absolute() then
 		vim.notify("Refusing to delete the current worktree.", vim.log.levels.WARN)
 		return
 	end
+
 	local args = { "git", "worktree", "remove" }
 	if force then
 		table.insert(args, "--force")
@@ -104,15 +177,15 @@ local function delete_worktree(path, force, branch)
 		vim.notify("Failed to delete worktree:\n" .. table.concat(err, "\n"), vim.log.levels.ERROR)
 		return
 	end
-	print("Deleted worktree: " .. path)
+	vim.notify("Deleted worktree: " .. path)
 
-	if branch and not branch:match("detached") then
+	if branch and not branch:match("^detached") then
 		local confirm = vim.fn.confirm("Delete branch '" .. branch .. "' too?", "&Yes\n&No\n&Force", 2)
 		if confirm == 1 or confirm == 3 then
 			local del_args = { "git", "branch", (confirm == 3) and "-D" or "-d", branch }
 			local bcode, _, berr = sh(del_args)
 			if bcode == 0 then
-				print(((confirm == 3) and "Force " or "") .. "deleted branch: " .. branch)
+				vim.notify(((confirm == 3) and "Force " or "") .. "deleted branch: " .. branch)
 			else
 				vim.notify("Failed to delete branch:\n" .. table.concat(berr, "\n"), vim.log.levels.ERROR)
 			end
@@ -120,19 +193,66 @@ local function delete_worktree(path, force, branch)
 	end
 end
 
--- entries with current mark
+-- -----------------------------------------------------------------------------
+-- Entries (with current *) and finder
+-- -----------------------------------------------------------------------------
 local function make_entries_with_current_mark()
 	local cwd = Path:new(vim.fn.getcwd()):absolute()
 	local entries = {}
 	for _, wt in ipairs(get_worktrees()) do
 		local path, branch = parse_worktree(wt)
-		local display = ((path == cwd) and "* " or "") .. branch .. " (" .. path .. ")"
+		local star = (path == cwd) and "* " or ""
+		local display = ("%s%s (%s)"):format(star, branch, path)
 		table.insert(entries, { path = path, branch = branch, display = display })
 	end
 	return entries
 end
 
--- telescope picker
+-- -----------------------------------------------------------------------------
+-- Copy extra files into new worktree
+-- -----------------------------------------------------------------------------
+local function copy_env_files(to_path)
+	local from = Path:new(vim.fn.getcwd())
+	for _, name in ipairs(cfg.copy_files or {}) do
+		local src = from:joinpath(name)
+		if src:exists() then
+			local dest = Path:new(to_path, name)
+			src:copy({ destination = dest, parents = true, override = true })
+			vim.schedule(function()
+				vim.notify(("Copied %s → %s"):format(name, tostring(dest)))
+			end)
+		end
+	end
+end
+
+-- -----------------------------------------------------------------------------
+-- Available branches (not already attached as worktrees)
+-- -----------------------------------------------------------------------------
+local function get_available_branches()
+	local code, all = sh({ "git", "branch", "--format=%(refname:short)" })
+	if code ~= 0 then
+		return {}
+	end
+
+	local existing = {}
+	for _, wt in ipairs(get_worktrees()) do
+		if wt.branch then
+			existing[wt.branch:gsub("^refs/heads/", "")] = true
+		end
+	end
+
+	local avail = {}
+	for _, b in ipairs(all) do
+		if b ~= "" and not existing[b] then
+			table.insert(avail, b)
+		end
+	end
+	return avail
+end
+
+-- -----------------------------------------------------------------------------
+-- Telescope: list worktrees
+-- -----------------------------------------------------------------------------
 local function git_worktrees(opts)
 	opts = opts or {}
 	local entries = make_entries_with_current_mark()
@@ -146,7 +266,7 @@ local function git_worktrees(opts)
 					return { value = e, display = e.display, ordinal = e.branch .. " " .. e.path }
 				end,
 			}),
-			sorter = sorters.get_generic_fuzzy_sorter({}),
+			sorter = sorters.get_generic_fuzzy_sorter(),
 			previewer = previewers.new_buffer_previewer({
 				title = "Worktree status",
 				define_preview = function(self, entry)
@@ -157,15 +277,17 @@ local function git_worktrees(opts)
 			}),
 			attach_mappings = function(prompt_bufnr, map)
 				actions.select_default:replace(function()
-					actions.close(prompt_bufnr)
 					local selection = action_state.get_selected_entry()
+					actions.close(prompt_bufnr)
 					switch_worktree(selection.value.path, selection.value.branch)
 				end)
+
 				local function del(force)
 					local selection = action_state.get_selected_entry()
 					actions.close(prompt_bufnr)
 					delete_worktree(selection.value.path, force, selection.value.branch)
 				end
+
 				map("i", "<C-d>", function()
 					del(false)
 				end)
@@ -184,41 +306,9 @@ local function git_worktrees(opts)
 		:find()
 end
 
--- copy env files
-local function copy_env_files(to_path)
-	local from = Path:new(vim.fn.getcwd())
-	for _, name in ipairs({ ".env", ".env.local" }) do
-		local src = from:joinpath(name)
-		if src:exists() then
-			local dest = Path:new(to_path, name)
-			src:copy({ destination = dest, parents = true, override = true })
-			print("Copied " .. name .. " → " .. tostring(dest))
-		end
-	end
-end
-
--- available branches (not already worktrees)
-local function get_available_branches()
-	local code, all = sh({ "git", "branch", "--list", "--format=%(refname:short)" })
-	if code ~= 0 then
-		return {}
-	end
-	local existing = {}
-	for _, wt in ipairs(get_worktrees()) do
-		if wt.branch then
-			existing[wt.branch:gsub("^refs/heads/", "")] = true
-		end
-	end
-	local avail = {}
-	for _, b in ipairs(all) do
-		if b ~= "" and not existing[b] then
-			table.insert(avail, b)
-		end
-	end
-	return avail
-end
-
--- create from existing branch
+-- -----------------------------------------------------------------------------
+-- Telescope: create from existing branch
+-- -----------------------------------------------------------------------------
 local function create_from_branch_git_worktree(opts)
 	opts = opts or {}
 	local branches = get_available_branches()
@@ -226,6 +316,7 @@ local function create_from_branch_git_worktree(opts)
 		vim.notify("No available branches.", vim.log.levels.INFO)
 		return
 	end
+
 	local entries = vim.tbl_map(function(b)
 		return { branch = b, display = b }
 	end, branches)
@@ -239,12 +330,13 @@ local function create_from_branch_git_worktree(opts)
 					return { value = e, display = e.display, ordinal = e.branch }
 				end,
 			}),
-			sorter = sorters.get_generic_fuzzy_sorter({}),
+			sorter = sorters.get_generic_fuzzy_sorter(),
 			attach_mappings = function(prompt_bufnr, _)
 				actions.select_default:replace(function()
 					local sel = action_state.get_selected_entry()
 					actions.close(prompt_bufnr)
 					local branch = sel.value.branch
+
 					vim.ui.input({ prompt = "Worktree path (default: " .. branch .. "): " }, function(new_path)
 						if not new_path or new_path == "" then
 							new_path = branch
@@ -262,9 +354,9 @@ local function create_from_branch_git_worktree(opts)
 							if upstream and upstream ~= "" then
 								sh({ "git", "-C", new_path, "branch", "--set-upstream-to", upstream })
 							end
-							print("Created worktree: " .. new_path .. " (branch " .. branch .. ")")
+							vim.notify(("Created worktree: %s (branch %s)"):format(new_path, branch))
 							if vim.fn.confirm("Switch to the new worktree?", "&Yes\n&No", 2) == 1 then
-								switch_worktree(new_path, branch)
+								switch_worktree(Path:new(new_path):absolute(), branch)
 							end
 						end)
 					end)
@@ -275,7 +367,9 @@ local function create_from_branch_git_worktree(opts)
 		:find()
 end
 
--- create new branch worktree
+-- -----------------------------------------------------------------------------
+-- Telescope: create brand new branch worktree
+-- -----------------------------------------------------------------------------
 local function create_new_git_worktree(opts)
 	opts = opts or {}
 	vim.ui.input({ prompt = "New branch name: " }, function(branch)
@@ -296,16 +390,18 @@ local function create_new_git_worktree(opts)
 				if upstream and upstream ~= "" then
 					sh({ "git", "-C", new_path, "branch", "--set-upstream-to", upstream })
 				end
-				print("Created worktree: " .. new_path .. " (new branch " .. branch .. ")")
+				vim.notify(("Created worktree: %s (new branch %s)"):format(new_path, branch))
 				if vim.fn.confirm("Switch to the new worktree?", "&Yes\n&No", 2) == 1 then
-					switch_worktree(new_path, branch)
+					switch_worktree(Path:new(new_path):absolute(), branch)
 				end
 			end)
 		end)
 	end)
 end
 
--- dedicated delete picker
+-- -----------------------------------------------------------------------------
+-- Telescope: dedicated delete picker
+-- -----------------------------------------------------------------------------
 local function delete_git_worktree(opts)
 	opts = opts or {}
 	local entries = make_entries_with_current_mark()
@@ -313,6 +409,7 @@ local function delete_git_worktree(opts)
 		vim.notify("No worktrees to delete.", vim.log.levels.INFO)
 		return
 	end
+
 	pickers
 		.new(opts, {
 			prompt_title = "Delete Git Worktree",
@@ -322,7 +419,7 @@ local function delete_git_worktree(opts)
 					return { value = e, display = e.display, ordinal = e.branch .. " " .. e.path }
 				end,
 			}),
-			sorter = sorters.get_generic_fuzzy_sorter({}),
+			sorter = sorters.get_generic_fuzzy_sorter(),
 			attach_mappings = function(prompt_bufnr, _)
 				actions.select_default:replace(function()
 					local sel = action_state.get_selected_entry()
@@ -340,7 +437,25 @@ local function delete_git_worktree(opts)
 		:find()
 end
 
-return require("telescope").register_extension({
+-- -----------------------------------------------------------------------------
+-- User commands (optional parity with the reference repo)
+-- -----------------------------------------------------------------------------
+vim.api.nvim_create_user_command("GitWorktrees", function()
+	git_worktrees({})
+end, {})
+vim.api.nvim_create_user_command("GitWorktreeCreate", function()
+	create_new_git_worktree({})
+end, {})
+vim.api.nvim_create_user_command("GitWorktreeCreateFrom", function()
+	create_from_branch_git_worktree({})
+end, {})
+vim.api.nvim_create_user_command("GitWorktreeDelete", function()
+	delete_git_worktree({})
+end, {})
+
+-- Telescope exports
+return telescope.register_extension({
+	setup = M.setup,
 	exports = {
 		git_worktrees = git_worktrees,
 		create_from_branch_git_worktree = create_from_branch_git_worktree,
